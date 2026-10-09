@@ -12,7 +12,8 @@ from fastapi import (
     FastAPI, Request, Depends, HTTPException, status, 
     Form, File, UploadFile, WebSocket, WebSocketDisconnect, Cookie
 )
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse
+from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -21,7 +22,7 @@ from json_db import db
 from manager import manager, datetime_now_str, logger
 from data_sandbox import safe_join
 
-app = FastAPI(title="Telegram Bot Hoster - MinuBotHoster")
+app = FastAPI(title="Telegram Bot Hoster - W8TelegramBotHoster")
 
 # Create directories if they do not exist
 os.makedirs("data/bots", exist_ok=True)
@@ -233,12 +234,53 @@ async def get_bot(bot_id: str, user: dict = Depends(get_current_user)):
     bot = verify_bot_ownership(bot_id, user)
     return bot
 
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB per file
+
+def save_uploaded_files(bot_dir: str, uploads: List[UploadFile]) -> List[str]:
+    """Saves individually uploaded files into bot_dir (flat, safe names). Returns saved names."""
+    saved = []
+    for up in uploads or []:
+        if not up or not up.filename:
+            continue  # empty file input
+        name = os.path.basename(up.filename.replace("\\", "/")).strip()
+        if not name or name in (".", ".."):
+            continue
+        try:
+            dest = safe_join(bot_dir, name)
+        except PermissionError:
+            continue
+        size = 0
+        with open(dest, "wb") as out:
+            while True:
+                chunk = up.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    out.close()
+                    os.remove(dest)
+                    raise HTTPException(status_code=400, detail=f"'{name}' is larger than 20 MB.")
+                out.write(chunk)
+        saved.append(name)
+    return saved
+
+@app.post("/api/bots/{bot_id}/files/upload")
+async def upload_files_endpoint(bot_id: str, files: List[UploadFile] = File(...), user: dict = Depends(get_current_user)):
+    verify_bot_ownership(bot_id, user)
+    bot_dir = os.path.abspath(os.path.join("data", "bots", bot_id))
+    os.makedirs(bot_dir, exist_ok=True)
+    saved = save_uploaded_files(bot_dir, files)
+    if not saved:
+        raise HTTPException(status_code=400, detail="No files received.")
+    return {"status": "success", "saved": saved}
+
 @app.post("/api/bots")
 async def create_bot(
     name: str = Form(...),
     entrypoint: str = Form("bot.py"),
-    source_type: str = Form(...), # zip, git, paste
+    source_type: str = Form(...), # zip, git, paste, files
     zip_file: Optional[UploadFile] = File(None),
+    upload_files: Optional[List[UploadFile]] = File(None),
     git_url: Optional[str] = Form(None),
     git_branch: Optional[str] = Form("main"),
     paste_code: Optional[str] = Form(None),
@@ -340,6 +382,22 @@ async def create_bot(
             # Log success
             with open(log_path, "w", encoding="utf-8") as f:
                 f.write(f"[MANAGER] Created entrypoint '{entrypoint}' and requirements.txt with pasted script.\n")
+        elif source_type == "files":
+            saved = save_uploaded_files(bot_dir, upload_files or [])
+            if not saved:
+                raise HTTPException(status_code=400, detail="Please choose at least one file to upload")
+            # If the entrypoint wasn't uploaded but exactly one .py file was, use that one
+            if entrypoint not in saved:
+                py_files = [n for n in saved if n.endswith(".py")]
+                if len(py_files) == 1:
+                    entrypoint = py_files[0]
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Entrypoint '{entrypoint}' is not among the uploaded files ({', '.join(saved)})."
+                    )
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(f"[MANAGER] Uploaded {len(saved)} file(s): {', '.join(saved)}. Entrypoint: {entrypoint}\n")
         else:
             raise HTTPException(status_code=400, detail="Invalid source type")
 
@@ -549,6 +607,46 @@ async def read_file(bot_id: str, path: str, user: dict = Depends(get_current_use
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read file: {str(e)}")
 
+@app.get("/api/bots/{bot_id}/files/download")
+async def download_file_endpoint(bot_id: str, path: str, user: dict = Depends(get_current_user)):
+    verify_bot_ownership(bot_id, user)
+    bot_dir = os.path.abspath(os.path.join("data", "bots", bot_id))
+    try:
+        abs_path = safe_join(bot_dir, path)
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe))
+    if not os.path.isfile(abs_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(abs_path, filename=os.path.basename(abs_path), media_type="application/octet-stream")
+
+@app.get("/api/bots/{bot_id}/download-all")
+async def download_all_endpoint(bot_id: str, user: dict = Depends(get_current_user)):
+    bot = verify_bot_ownership(bot_id, user)
+    bot_dir = os.path.abspath(os.path.join("data", "bots", bot_id))
+    if not os.path.isdir(bot_dir):
+        raise HTTPException(status_code=404, detail="Bot directory not found")
+    skip = {"venv", "__pycache__", ".git"}
+    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    tmp.close()
+    try:
+        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
+            for root, dirs, files in os.walk(bot_dir):
+                dirs[:] = [d for d in dirs if d not in skip]
+                for f in files:
+                    full = os.path.join(root, f)
+                    zf.write(full, os.path.relpath(full, bot_dir))
+    except Exception as e:
+        os.remove(tmp.name)
+        raise HTTPException(status_code=500, detail=f"Failed to build zip: {str(e)}")
+    safe_name = "".join(c for c in bot.get("name", bot_id) if c.isalnum() or c in "-_") or bot_id
+    return FileResponse(tmp.name, filename=f"{safe_name}.zip", media_type="application/zip",
+                        background=BackgroundTask(os.remove, tmp.name))
+
+@app.get("/api/bots/{bot_id}/process")
+async def get_bot_process_info(bot_id: str, user: dict = Depends(get_current_user)):
+    verify_bot_ownership(bot_id, user)
+    return manager.get_process_info(bot_id)
+
 class WriteFileRequest(BaseModel):
     path: str
     content: str
@@ -586,6 +684,41 @@ async def write_file_endpoint(bot_id: str, req: WriteFileRequest, user: dict = D
         raise HTTPException(status_code=403, detail=str(pe))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to write file: {str(e)}")
+
+class RenameFileRequest(BaseModel):
+    path: str
+    new_name: str
+
+@app.post("/api/bots/{bot_id}/files/rename")
+async def rename_file_endpoint(bot_id: str, req: RenameFileRequest, user: dict = Depends(get_current_user)):
+    bot = verify_bot_ownership(bot_id, user)
+    bot_dir = os.path.abspath(os.path.join("data", "bots", bot_id))
+    new_name = req.new_name.strip()
+    if not new_name or "/" in new_name or "\\" in new_name or new_name in (".", ".."):
+        raise HTTPException(status_code=400, detail="Invalid file name.")
+    try:
+        old_abs = safe_join(bot_dir, req.path)
+        new_abs = safe_join(os.path.dirname(old_abs), new_name)
+        safe_join(bot_dir, os.path.relpath(new_abs, bot_dir))
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe))
+    if not os.path.exists(old_abs):
+        raise HTTPException(status_code=404, detail="File not found")
+    if os.path.exists(new_abs):
+        raise HTTPException(status_code=400, detail="A file with that name already exists.")
+
+    old_rel = os.path.relpath(old_abs, bot_dir).replace("\\", "/")
+    new_rel = os.path.relpath(new_abs, bot_dir).replace("\\", "/")
+    is_entry = old_rel == bot.get("entrypoint", "bot.py")
+    if is_entry and not new_name.endswith(".py"):
+        raise HTTPException(status_code=400, detail="The entrypoint file must keep a .py extension.")
+    try:
+        os.rename(old_abs, new_abs)
+        if is_entry:
+            db.update_bot(bot_id, {"entrypoint": new_rel})
+        return {"status": "success", "new_path": new_rel, "entrypoint_changed": is_entry}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to rename: {str(e)}")
 
 class CreateFileRequest(BaseModel):
     path: str
@@ -775,6 +908,13 @@ async def websocket_logs(websocket: WebSocket, bot_id: str):
                 while True:
                     line = f.readline()
                     if not line:
+                        # Log rotation shrinks the file: restart from the new beginning
+                        try:
+                            if os.path.getsize(log_path) < f.tell():
+                                f.seek(0)
+                                continue
+                        except OSError:
+                            pass
                         await asyncio.sleep(0.2)
                         continue
                     await websocket.send_text(line)
