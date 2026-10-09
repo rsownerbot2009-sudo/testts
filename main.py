@@ -21,7 +21,7 @@ from json_db import db
 from manager import manager, datetime_now_str, logger
 from data_sandbox import safe_join
 
-app = FastAPI(title="Telegram Bot Hoster - W8TelegramBotHoster")
+app = FastAPI(title="Telegram Bot Hoster - MinuBotHoster")
 
 # Create directories if they do not exist
 os.makedirs("data/bots", exist_ok=True)
