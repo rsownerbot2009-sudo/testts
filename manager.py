@@ -176,6 +176,8 @@ class BotManager:
             
             # Setup environment variables
             env = os.environ.copy()
+            # Force unbuffered output so print() shows up in the console instantly
+            env["PYTHONUNBUFFERED"] = "1"
             # Inject bot specific env vars
             token_to_verify = None
             for k, v in bot.get("env_vars", {}).items():
@@ -305,6 +307,31 @@ class BotManager:
     def restart_bot(self, bot_id: str) -> bool:
         self.stop_bot(bot_id)
         return self.start_bot(bot_id)
+
+    def get_process_info(self, bot_id: str) -> dict:
+        """Returns which file is running, PID, uptime and child processes for a bot."""
+        bot = db.get_bot(bot_id) or {}
+        entrypoint = bot.get("entrypoint", "bot.py")
+        info = {"running": False, "entrypoint": entrypoint, "pid": None, "uptime": 0, "cmdline": "", "children": []}
+        proc = self.processes.get(bot_id)
+        if not proc or proc.poll() is not None:
+            return info
+        try:
+            p = psutil.Process(proc.pid)
+            info.update({
+                "running": True,
+                "pid": proc.pid,
+                "uptime": int(datetime.datetime.now().timestamp() - p.create_time()),
+                "cmdline": " ".join(os.path.basename(c) if i == 0 else c for i, c in enumerate(p.cmdline())),
+            })
+            for c in p.children(recursive=True):
+                try:
+                    info["children"].append({"pid": c.pid, "cmdline": " ".join(c.cmdline())[:200]})
+                except Exception:
+                    pass
+        except Exception:
+            info["running"] = False
+        return info
 
     def get_bot_metrics(self, bot_id: str) -> dict:
         """Returns CPU, RAM, and uptime metrics for a running bot process."""
